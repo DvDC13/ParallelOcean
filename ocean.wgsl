@@ -174,7 +174,11 @@ struct RenderUniforms {
     cascadePatch0: f32,        // 96-99
     cascadePatch1: f32,        // 100-103
     cascadePatch2: f32,        // 104-107
-    pad: f32,                  // 108-111 (padding to 112 bytes)
+    cloudCoverage: f32,        // 108-111
+    cloudSpeed: f32,           // 112-115
+    pad1: f32,                 // 116-119
+    pad2: f32,                 // 120-123
+    pad3: f32,                 // 124-127 (total 128 bytes)
 };
 
 // Cascade 0 — large swells
@@ -303,10 +307,9 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     var waterColor = mix(deepColor, shallowColor, NdotV);
     waterColor *= (0.6 + 0.4 * NdotL);  // basic lighting
 
-    // --- Sky reflection (simple gradient) ---
+    // --- Sky reflection (use actual sky color) ---
     let R = reflect(-V, N);
-    let skyBlend = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
-    let skyColor = mix(vec3f(0.6, 0.7, 0.8), vec3f(0.3, 0.5, 0.9), skyBlend);
+    let reflectSky = skyColor(R, render.sunDir, render.time);
 
     // --- Sun specular highlight ---
     let H = normalize(L + V);
@@ -315,12 +318,260 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     let specColor = vec3f(1.0, 0.95, 0.85) * spec;
 
     // --- Combine ---
-    var color = mix(waterColor, skyColor, fresnel) + specColor;
+    var color = mix(waterColor, reflectSky, fresnel) + specColor;
 
-    // --- Distance fog ---
+    // --- Distance fog (matches sky horizon) ---
     let fogFactor = clamp((inp.distToEye - 800.0) / 4200.0, 0.0, 1.0);
-    let fogColor = vec3f(0.5, 0.6, 0.75);
+    let fogColor = skyColor(vec3f(0.0, 0.02, 1.0), render.sunDir, render.time);
     color = mix(color, fogColor, fogFactor * fogFactor);
 
     return vec4f(color, 1.0);
+}
+
+// ==========================================
+// Step 4: Sky rendering
+// ==========================================
+
+// --- Noise helpers for clouds ---
+fn hash31(p: vec3f) -> f32 {
+    var q = fract(p * vec3f(443.897, 441.423, 437.195));
+    q += dot(q, q.yzx + 19.19);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn valueNoise3D(p: vec3f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(mix(hash31(i + vec3f(0,0,0)), hash31(i + vec3f(1,0,0)), u.x),
+            mix(hash31(i + vec3f(0,1,0)), hash31(i + vec3f(1,1,0)), u.x), u.y),
+        mix(mix(hash31(i + vec3f(0,0,1)), hash31(i + vec3f(1,0,1)), u.x),
+            mix(hash31(i + vec3f(0,1,1)), hash31(i + vec3f(1,1,1)), u.x), u.y),
+        u.z
+    );
+}
+
+fn fbm5(p: vec3f) -> f32 {
+    var val = 0.0;
+    var amp = 0.5;
+    var pos = p;
+    for (var i = 0; i < 5; i++) {
+        val += amp * valueNoise3D(pos);
+        pos = pos * 2.07 + vec3f(1.17, 0.83, 0.61);
+        amp *= 0.48;
+    }
+    return val;
+}
+
+fn cloudDensity(worldPos: vec3f, time: f32, coverage: f32, speed: f32) -> f32 {
+    let cloudBase = 2000.0;
+    let cloudTop = 4500.0;
+    let hFrac = (worldPos.y - cloudBase) / (cloudTop - cloudBase);
+    if (hFrac < 0.0 || hFrac > 1.0) { return 0.0; }
+    let heightMask = smoothstep(0.0, 0.25, hFrac) * smoothstep(1.0, 0.65, hFrac);
+    let windDir = vec3f(speed, 0.0, speed * 0.6) * time;
+    let p = worldPos * 0.00035 + windDir * 0.00035;
+    let noise = fbm5(p);
+    let threshold = 1.0 - coverage;
+    let density = smoothstep(threshold, threshold + 0.25, noise) * heightMask;
+    return density;
+}
+
+fn screenHash(uv: vec2f) -> f32 {
+    return fract(sin(dot(uv, vec2f(12.9898, 78.233))) * 43758.5453);
+}
+
+fn raymarchClouds(rayOrigin: vec3f, rayDir: vec3f, sunDir: vec3f, time: f32, coverage: f32, speed: f32) -> vec4f {
+    let cloudBase = 2000.0;
+    let cloudTop = 4500.0;
+    if (rayDir.y <= 0.005) { return vec4f(0.0); }
+    let tBase = (cloudBase - rayOrigin.y) / rayDir.y;
+    let tTop = (cloudTop - rayOrigin.y) / rayDir.y;
+    if (tBase < 0.0) { return vec4f(0.0); }
+    let tStart = max(tBase, 0.0);
+    let tEnd = tTop;
+    let maxDist = 40000.0;
+    let tClamped = min(tEnd, tStart + maxDist);
+    let numSteps = 32u;
+    let stepSize = (tClamped - tStart) / f32(numSteps);
+    let jitter = screenHash(rayDir.xz * 1000.0 + vec2f(time * 7.0)) * stepSize;
+    var transmittance = 1.0;
+    var lightColor = vec3f(0.0);
+    let L = normalize(sunDir);
+    let sunElev = L.y;
+    let cloudDayFactor = clamp(sunElev * 5.0, 0.0, 1.0);
+    let daySunCol = vec3f(1.0, 0.95, 0.85);
+    let sunsetSunCol = vec3f(1.0, 0.6, 0.3);
+    let sunCol = mix(sunsetSunCol, daySunCol, clamp(sunElev * 3.0, 0.0, 1.0)) * (1.0 + cloudDayFactor);
+    let ambientCol = mix(vec3f(0.08, 0.1, 0.2), vec3f(0.5, 0.6, 0.8), cloudDayFactor);
+    let cosAngle = dot(rayDir, L);
+    let forwardScatter = pow(max(cosAngle, 0.0), 4.0) * 0.5;
+    let backScatter = 0.2;
+    let phase = forwardScatter + backScatter;
+    for (var i = 0u; i < numSteps; i++) {
+        let t = tStart + jitter + f32(i) * stepSize;
+        if (t > tClamped) { break; }
+        let pos = rayOrigin + rayDir * t;
+        let density = cloudDensity(pos, time, coverage, speed);
+        if (density > 0.005) {
+            let ls1 = cloudDensity(pos + L * 120.0, time, coverage, speed);
+            let ls2 = cloudDensity(pos + L * 300.0, time, coverage, speed);
+            let lightOD = ls1 * 0.6 + ls2 * 0.4;
+            let lightTransmit = exp(-lightOD * 4.5);
+            let powder = 1.0 - exp(-density * 6.0);
+            let lit = sunCol * lightTransmit * phase * powder + ambientCol * 0.4;
+            let edge = exp(-density * 3.0) * pow(max(cosAngle, 0.0), 2.0) * 0.3;
+            let cloudCol = lit + sunCol * edge;
+            let absorption = density * stepSize * 0.004;
+            lightColor += transmittance * cloudCol * absorption;
+            transmittance *= exp(-absorption);
+        }
+        if (transmittance < 0.02) { break; }
+    }
+    let horizonFade = smoothstep(0.005, 0.1, rayDir.y);
+    let alpha = (1.0 - transmittance) * horizonFade;
+    return vec4f(lightColor * horizonFade, alpha);
+}
+
+// --- Stars ---
+fn starHash(p: vec2f) -> f32 {
+    return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+}
+
+fn stars(rayDir: vec3f, time: f32) -> f32 {
+    let p = rayDir.xz / (rayDir.y + 0.001) * 80.0;
+    let cell = floor(p);
+    let f = fract(p);
+    let rand = starHash(cell);
+    if (rand > 0.04) { return 0.0; }
+    let starPos = vec2f(fract(rand * 17.3) * 0.6 + 0.2, fract(rand * 31.7) * 0.6 + 0.2);
+    let d = length(f - starPos);
+    let size = 0.01 + fract(rand * 7.1) * 0.025;
+    let twinkle = 0.7 + 0.3 * sin(rand * 100.0 + time * (2.0 + rand * 4.0));
+    return smoothstep(size, 0.0, d) * twinkle;
+}
+
+// --- Analytical sky color ---
+fn skyColor(rayDir: vec3f, sunDir: vec3f, time: f32) -> vec3f {
+    let L = normalize(sunDir);
+    let elevation = max(rayDir.y, 0.0);
+    let sunElev = L.y;
+    let dayFactor = clamp(sunElev * 5.0, 0.0, 1.0);
+    let sunsetFactor = smoothstep(0.3, 0.05, sunElev) * smoothstep(-0.1, 0.02, sunElev);
+
+    // Day sky
+    let skyZenith  = vec3f(0.1, 0.3, 0.75);
+    let skyMid     = vec3f(0.35, 0.6, 0.95);
+    let skyHorizon = vec3f(0.65, 0.82, 0.98);
+    var daySky: vec3f;
+    if (elevation < 0.15) {
+        daySky = mix(skyHorizon, skyMid, elevation / 0.15);
+    } else {
+        daySky = mix(skyMid, skyZenith, pow((elevation - 0.15) / 0.85, 0.6));
+    }
+
+    // Sunset sky
+    let sunsetHorizon = vec3f(0.9, 0.4, 0.15);
+    let sunsetMid = vec3f(0.7, 0.25, 0.3);
+    let sunsetZenith = vec3f(0.15, 0.1, 0.35);
+    var sunsetSky: vec3f;
+    if (elevation < 0.15) {
+        sunsetSky = mix(sunsetHorizon, sunsetMid, elevation / 0.15);
+    } else {
+        sunsetSky = mix(sunsetMid, sunsetZenith, (elevation - 0.15) / 0.85);
+    }
+    let sunHorizDot = max(dot(normalize(vec3f(rayDir.x, 0.0, rayDir.z)), normalize(vec3f(L.x, 0.0, L.z))), 0.0);
+    let sunsetDirWeight = pow(sunHorizDot, 1.5) * 0.6 + 0.4;
+
+    // Night sky
+    let nightZenith = vec3f(0.005, 0.008, 0.025);
+    let nightHorizon = vec3f(0.02, 0.025, 0.05);
+    let nightSky = mix(nightHorizon, nightZenith, pow(elevation, 0.5));
+
+    // Blend
+    var sky = mix(nightSky, daySky, dayFactor);
+    sky = mix(sky, sunsetSky * sunsetDirWeight, sunsetFactor);
+
+    // Sun disk and glow
+    let sunDot = max(dot(rayDir, L), 0.0);
+    let sunCol = mix(vec3f(1.0, 0.4, 0.1), vec3f(1.0, 0.95, 0.85), clamp(sunElev * 4.0, 0.0, 1.0));
+    let sunBrightness = max(sunElev * 2.0, 0.0);
+    let sunDisk = pow(sunDot, 1500.0) * 25.0 * sunBrightness;
+    let sunGlow = pow(sunDot, 80.0) * 0.6 * sunBrightness;
+    let sunHalo = pow(sunDot, 16.0) * 0.12 * sunBrightness;
+    sky += sunCol * (sunDisk + sunGlow + sunHalo);
+
+    // Atmospheric scattering
+    let scatter = pow(sunDot, 3.0) * 0.35;
+    let scatterCol = mix(vec3f(0.6, 0.2, 0.05), vec3f(0.4, 0.25, 0.05), dayFactor);
+    sky += scatterCol * scatter * (1.0 - elevation) * max(sunElev + 0.1, 0.0);
+    let mie = pow(sunDot, 5.0) * 0.15;
+    sky += vec3f(0.35, 0.3, 0.2) * mie * sunBrightness;
+
+    // Stars
+    if (dayFactor < 0.8 && rayDir.y > 0.01) {
+        let starBrightness = stars(rayDir, time) * (1.0 - dayFactor);
+        sky += vec3f(0.8, 0.85, 1.0) * starBrightness;
+    }
+
+    // Moon
+    let moonDir = normalize(vec3f(-L.x, max(abs(L.y), 0.15), -L.z));
+    let moonDot = max(dot(rayDir, moonDir), 0.0);
+    let moonDisk = pow(moonDot, 3000.0) * 8.0;
+    let moonGlow = pow(moonDot, 200.0) * 0.3;
+    let moonVis = (1.0 - dayFactor) * smoothstep(-0.05, 0.1, moonDir.y);
+    sky += vec3f(0.7, 0.75, 0.85) * (moonDisk + moonGlow) * moonVis;
+
+    // Below horizon
+    if (rayDir.y < 0.0) {
+        let t = min(-rayDir.y * 4.0, 1.0);
+        let belowCol = mix(nightHorizon, vec3f(0.35, 0.45, 0.55), dayFactor);
+        sky = mix(sky, belowCol, t);
+    }
+
+    return sky;
+}
+
+// --- Sky vertex/fragment shaders ---
+struct SkyVsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) rayDir: vec3f,
+};
+
+@group(0) @binding(0) var<uniform> skyUniforms: RenderUniforms;
+@group(0) @binding(1) var<uniform> invViewProj: mat4x4f;
+
+@vertex
+fn skyVs(@builtin(vertex_index) vid: u32) -> SkyVsOut {
+    let uv = vec2f(f32((vid << 1u) & 2u), f32(vid & 2u));
+    let clipPos = vec4f(uv * 2.0 - 1.0, 1.0, 1.0);
+    var out: SkyVsOut;
+    out.pos = clipPos;
+    out.rayDir = vec3f(uv * 2.0 - 1.0, 0.0);
+    return out;
+}
+
+@fragment
+fn skyFs(inp: SkyVsOut) -> @location(0) vec4f {
+    let clipPos = vec4f(inp.rayDir.xy, 1.0, 1.0);
+    let worldPos4 = invViewProj * clipPos;
+    let worldPos = worldPos4.xyz / worldPos4.w;
+    let rayDir = normalize(worldPos - skyUniforms.eyePos);
+
+    // Base sky color (analytical)
+    var sky = skyColor(rayDir, skyUniforms.sunDir, skyUniforms.time);
+
+    // Volumetric clouds
+    let clouds = raymarchClouds(
+        skyUniforms.eyePos,
+        rayDir,
+        skyUniforms.sunDir,
+        skyUniforms.time,
+        skyUniforms.cloudCoverage,
+        skyUniforms.cloudSpeed,
+    );
+    sky = mix(sky, clouds.rgb, clouds.a);
+
+    return vec4f(sky, 1.0);
 }

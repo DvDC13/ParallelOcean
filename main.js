@@ -1,4 +1,4 @@
-import { OrbitCamera, mat4Multiply } from "./camera.js";
+import { OrbitCamera, mat4Multiply, mat4Inverse } from "./camera.js";
 import { generateInitialSpectrum } from './spectrum.js';
 
 // ===== Configuration =====
@@ -212,9 +212,9 @@ async function main() {
     }));
 
     // --- Render pipeline (draws the ocean triangles) ---
-    // Uniform buffer: 112 bytes (matches RenderUniforms in shader)
+    // Uniform buffer: 128 bytes (matches RenderUniforms in shader)
     const renderUniformBuf = device.createBuffer({
-        size: 112,
+        size: 128,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -255,6 +255,32 @@ async function main() {
             { binding: 8,  resource: { buffer: cascades[2].htBuf } },
             { binding: 9,  resource: { buffer: cascades[2].dxtBuf } },
             { binding: 10, resource: { buffer: cascades[2].dztBuf } },
+        ],
+    });
+
+    // --- Sky pipeline ---
+    const invViewProjBuf = device.createBuffer({
+        size: 64,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const skyPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: shaderModule, entryPoint: 'skyVs' },
+        fragment: { module: shaderModule, entryPoint: 'skyFs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+        depthStencil: {
+            format: 'depth24plus',
+            depthWriteEnabled: false,
+            depthCompare: 'always',
+        },
+    });
+
+    const skyBG = device.createBindGroup({
+        layout: skyPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: renderUniformBuf } },
+            { binding: 1, resource: { buffer: invViewProjBuf } },
         ],
     });
 
@@ -306,14 +332,15 @@ async function main() {
             device.queue.writeBuffer(cascades[i].timeParamBuf, 0, buf);
         }
 
-        // Upload render uniforms (112 bytes)
+        // Upload render uniforms (128 bytes)
         const view = camera.viewMatrix();
         const proj = camera.projMatrix();
         const viewProj = mat4Multiply(proj, view);
+        const invVP = mat4Inverse(viewProj);
         const eye = camera.eye;
         const sun = sunDir();
 
-        const uniformData = new ArrayBuffer(112);
+        const uniformData = new ArrayBuffer(128);
         const f = new Float32Array(uniformData);
         f.set(viewProj, 0);         // 0-15: viewProj matrix
         f[16] = eye[0];             // 16: eyePos.x
@@ -327,8 +354,15 @@ async function main() {
         f[24] = CASCADE_PATCHES[0]; // 24: cascadePatch0
         f[25] = CASCADE_PATCHES[1]; // 25: cascadePatch1
         f[26] = CASCADE_PATCHES[2]; // 26: cascadePatch2
-        f[27] = 0;                  // 27: pad
+        f[27] = 0.5;               // 27: cloudCoverage
+        f[28] = 25;                // 28: cloudSpeed
+        f[29] = 0;                  // 29: pad1
+        f[30] = 0;                  // 30: pad2
+        f[31] = 0;                  // 31: pad3
         device.queue.writeBuffer(renderUniformBuf, 0, uniformData);
+
+        // Upload invViewProj for sky shader
+        device.queue.writeBuffer(invViewProjBuf, 0, invVP);
 
         // --- GPU commands ---
         const encoder = device.createCommandEncoder();
@@ -361,7 +395,7 @@ async function main() {
                 view: context.getCurrentTexture().createView(),
                 loadOp: 'clear',
                 storeOp: 'store',
-                clearValue: { r: 0.5, g: 0.6, b: 0.75, a: 1 },  // sky-ish blue background
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
             }],
             depthStencilAttachment: {
                 view: depthTexture.createView(),
@@ -371,6 +405,12 @@ async function main() {
             },
         });
 
+        // Draw sky first (fullscreen triangle, no vertex buffers)
+        renderPass.setPipeline(skyPipeline);
+        renderPass.setBindGroup(0, skyBG);
+        renderPass.draw(3);
+
+        // Draw ocean on top
         renderPass.setPipeline(renderPipeline);
         renderPass.setBindGroup(0, renderBG);
         for (let i = 0; i < LOD_LEVELS.length; i++) {
