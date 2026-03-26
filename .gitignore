@@ -1,0 +1,5 @@
+node_modules
+Minimal_Ocean_Guide.docx
+package-lock.json
+package.json
+generate_guide.cjs
