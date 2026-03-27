@@ -41,6 +41,15 @@ const params = {
     // Day/Night
     autoCycle: false,
     cycleSpeed: 0.02,
+
+    // Post-processing
+    bloomStrength: 0.25,
+    bloomThreshold: 1.5,
+    exposure: 1.0,
+    contrast: 1.1,
+    saturation: 1.1,
+    vignetteStrength: 0.3,
+    godRayStrength: 0.8,
 };
 
 // ===== Helper: create a flat grid mesh =====
@@ -174,9 +183,14 @@ async function main() {
     }
     regenerateSpectrum();
 
-    // --- Load and compile the shader ---
+    // --- Load and compile shaders ---
     const shaderCode = await (await fetch('ocean.wgsl')).text();
     const shaderModule = device.createShaderModule({ code: shaderCode });
+
+    const postShaderCode = await (await fetch('post.wgsl')).text();
+    const postShaderModule = device.createShaderModule({ code: postShaderCode });
+
+    const hdrFormat = 'rgba16float';
 
     // --- Create compute pipelines ---
     const timeEvoPipeline = device.createComputePipeline({
@@ -250,7 +264,7 @@ async function main() {
         fragment: {
             module: shaderModule,
             entryPoint: 'fs',
-            targets: [{ format }],
+            targets: [{ format: hdrFormat }],
         },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: {
@@ -286,7 +300,7 @@ async function main() {
     const skyPipeline = device.createRenderPipeline({
         layout: 'auto',
         vertex: { module: shaderModule, entryPoint: 'skyVs' },
-        fragment: { module: shaderModule, entryPoint: 'skyFs', targets: [{ format }] },
+        fragment: { module: shaderModule, entryPoint: 'skyFs', targets: [{ format: hdrFormat }] },
         primitive: { topology: 'triangle-list' },
         depthStencil: {
             format: 'depth24plus',
@@ -303,16 +317,121 @@ async function main() {
         ],
     });
 
-    // --- Depth texture (recreated on resize) ---
-    let depthTexture = null;
+    // --- Post-processing pipelines ---
+    const postParamsBuffer = device.createBuffer({
+        size: 48, // PostParams: 12 floats = 48 bytes
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const blurDirBuffer = device.createBuffer({
+        size: 16, // vec4f
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
-    function ensureDepthTexture(w, h) {
-        if (depthTexture && depthTexture.width === w && depthTexture.height === h) return;
+    const bloomExtractPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: postShaderModule, entryPoint: 'postVs' },
+        fragment: { module: postShaderModule, entryPoint: 'bloomExtractFs', targets: [{ format: hdrFormat }] },
+        primitive: { topology: 'triangle-list' },
+    });
+
+    const blurPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: postShaderModule, entryPoint: 'postVs' },
+        fragment: { module: postShaderModule, entryPoint: 'blurFs', targets: [{ format: hdrFormat }] },
+        primitive: { topology: 'triangle-list' },
+    });
+
+    const compositePipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: postShaderModule, entryPoint: 'postVs' },
+        fragment: { module: postShaderModule, entryPoint: 'compositeFs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+    });
+
+    const linearSampler = device.createSampler({
+        magFilter: 'linear',
+        minFilter: 'linear',
+    });
+
+    // --- Managed textures (recreated on resize) ---
+    let hdrTexture = null, depthTexture = null, bloomTex0 = null, bloomTex1 = null;
+    let bloomExtractBG = null, blurHBG = null, blurVBG = null, compositeBG = null;
+    let lastW = 0, lastH = 0;
+
+    function recreatePostTextures(w, h) {
+        if (w === lastW && h === lastH) return;
+        lastW = w; lastH = h;
+
+        // Destroy old textures
+        if (hdrTexture) hdrTexture.destroy();
         if (depthTexture) depthTexture.destroy();
+        if (bloomTex0) bloomTex0.destroy();
+        if (bloomTex1) bloomTex1.destroy();
+
+        // HDR scene texture (full resolution)
+        hdrTexture = device.createTexture({
+            size: [w, h],
+            format: hdrFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+
+        // Depth buffer
         depthTexture = device.createTexture({
             size: [w, h],
             format: 'depth24plus',
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+
+        // Bloom textures (half resolution for performance)
+        const bloomW = Math.max(1, w >> 1);
+        const bloomH = Math.max(1, h >> 1);
+        bloomTex0 = device.createTexture({
+            size: [bloomW, bloomH],
+            format: hdrFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        bloomTex1 = device.createTexture({
+            size: [bloomW, bloomH],
+            format: hdrFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        });
+
+        // Recreate bind groups that reference these textures
+        bloomExtractBG = device.createBindGroup({
+            layout: bloomExtractPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: hdrTexture.createView() },
+                { binding: 1, resource: linearSampler },
+                { binding: 2, resource: { buffer: postParamsBuffer } },
+            ],
+        });
+
+        blurHBG = device.createBindGroup({
+            layout: blurPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: bloomTex0.createView() },
+                { binding: 1, resource: linearSampler },
+                { binding: 2, resource: { buffer: blurDirBuffer } },
+            ],
+        });
+
+        blurVBG = device.createBindGroup({
+            layout: blurPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: bloomTex1.createView() },
+                { binding: 1, resource: linearSampler },
+                { binding: 2, resource: { buffer: blurDirBuffer } },
+            ],
+        });
+
+        compositeBG = device.createBindGroup({
+            layout: compositePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: hdrTexture.createView() },
+                { binding: 1, resource: bloomTex0.createView() },
+                { binding: 2, resource: linearSampler },
+                { binding: 3, resource: { buffer: postParamsBuffer } },
+            ],
         });
     }
 
@@ -325,6 +444,23 @@ async function main() {
             Math.sin(el),
             Math.cos(el) * Math.cos(az),
         ];
+    }
+
+    // --- Compute sun screen position for god rays ---
+    function sunScreenPos(viewProj, sun) {
+        // Place sun far away in world space
+        const sx = sun[0] * 10000;
+        const sy = sun[1] * 10000;
+        const sz = sun[2] * 10000;
+        // Transform through viewProj
+        const clipX = viewProj[0]*sx + viewProj[4]*sy + viewProj[8]*sz + viewProj[12];
+        const clipY = viewProj[1]*sx + viewProj[5]*sy + viewProj[9]*sz + viewProj[13];
+        const clipW = viewProj[3]*sx + viewProj[7]*sy + viewProj[11]*sz + viewProj[15];
+        if (clipW <= 0) return null; // Sun behind camera
+        const ndcX = clipX / clipW;
+        const ndcY = clipY / clipW;
+        // NDC to UV (0-1), flip Y
+        return [ndcX * 0.5 + 0.5, -ndcY * 0.5 + 0.5];
     }
 
     // --- GUI ---
@@ -349,7 +485,7 @@ async function main() {
     sunFolder.add(params, 'sunElevation', -20, 90).name('Elevation \u00B0');
 
     const dayFolder = gui.addFolder('Day/Night');
-    dayFolder.add(params, 'autoCycle', ).name('Auto Cycle');
+    dayFolder.add(params, 'autoCycle').name('Auto Cycle');
     dayFolder.add(params, 'cycleSpeed', 0.001, 0.1);
 
     const atmosFolder = gui.addFolder('Atmosphere');
@@ -359,6 +495,15 @@ async function main() {
     const cloudFolder = gui.addFolder('Clouds');
     cloudFolder.add(params, 'cloudCoverage', 0, 1);
     cloudFolder.add(params, 'cloudSpeed', 0, 100);
+
+    const postFolder = gui.addFolder('Post-Processing');
+    postFolder.add(params, 'bloomStrength', 0, 1).name('Bloom Strength');
+    postFolder.add(params, 'bloomThreshold', 0.5, 5).name('Bloom Threshold');
+    postFolder.add(params, 'exposure', 0.1, 3).name('Exposure');
+    postFolder.add(params, 'contrast', 0.5, 2).name('Contrast');
+    postFolder.add(params, 'saturation', 0, 2).name('Saturation');
+    postFolder.add(params, 'vignetteStrength', 0, 1).name('Vignette');
+    postFolder.add(params, 'godRayStrength', 0, 2).name('God Rays');
 
     // ===== Frame loop =====
     let accTime = 0;
@@ -382,7 +527,7 @@ async function main() {
 
         const w = canvas.width;
         const h = canvas.height;
-        ensureDepthTexture(w, h);
+        recreatePostTextures(w, h);
 
         // Upload time params for each cascade
         for (let i = 0; i < 3; i++) {
@@ -426,18 +571,33 @@ async function main() {
         // Upload invViewProj for sky shader
         device.queue.writeBuffer(invViewProjBuf, 0, invVP);
 
+        // Upload post-processing params (48 bytes = 12 floats)
+        const sunUV = sunScreenPos(viewProj, sun);
+        const postData = new Float32Array(12);
+        postData[0] = w;                          // resolution.x
+        postData[1] = h;                          // resolution.y
+        postData[2] = params.bloomStrength;
+        postData[3] = params.bloomThreshold;
+        postData[4] = params.exposure;
+        postData[5] = params.contrast;
+        postData[6] = params.saturation;
+        postData[7] = params.vignetteStrength;
+        postData[8] = accTime;                    // time
+        postData[9] = sunUV ? sunUV[0] : -10;    // sunScreenX (-10 = disabled)
+        postData[10] = sunUV ? sunUV[1] : -10;   // sunScreenY
+        postData[11] = sunUV ? params.godRayStrength : 0; // godRayStrength (0 if sun behind camera)
+        device.queue.writeBuffer(postParamsBuffer, 0, postData);
+
         // --- GPU commands ---
         const encoder = device.createCommandEncoder();
 
         // Compute pass: time evolution + FFT for all 3 cascades
         const comp = encoder.beginComputePass();
         for (let i = 0; i < 3; i++) {
-            // Time evolution
             comp.setPipeline(timeEvoPipeline);
             comp.setBindGroup(0, timeEvoBGs[i]);
             comp.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(N / 16));
 
-            // FFT for ht, dxt, dzt (each needs row pass then column pass)
             const fft = cascadeFFT[i];
             for (const signal of [fft.ht, fft.dxt, fft.dzt]) {
                 comp.setPipeline(fftRowPipeline);
@@ -451,10 +611,10 @@ async function main() {
         }
         comp.end();
 
-        // Render pass: draw the ocean
+        // ---- Pass 1: Render scene → HDR texture ----
         const renderPass = encoder.beginRenderPass({
             colorAttachments: [{
-                view: context.getCurrentTexture().createView(),
+                view: hdrTexture.createView(),
                 loadOp: 'clear',
                 storeOp: 'store',
                 clearValue: { r: 0, g: 0, b: 0, a: 1 },
@@ -467,7 +627,7 @@ async function main() {
             },
         });
 
-        // Draw sky first (fullscreen triangle, no vertex buffers)
+        // Draw sky first
         renderPass.setPipeline(skyPipeline);
         renderPass.setBindGroup(0, skyBG);
         renderPass.draw(3);
@@ -484,6 +644,66 @@ async function main() {
             renderPass.drawIndexed(mesh.indexCount, range.instanceCount, 0, 0, range.firstInstance);
         }
         renderPass.end();
+
+        // ---- Pass 2: Bloom extract (HDR → bloomTex0 at half res) ----
+        const extractPass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: bloomTex0.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }],
+        });
+        extractPass.setPipeline(bloomExtractPipeline);
+        extractPass.setBindGroup(0, bloomExtractBG);
+        extractPass.draw(3);
+        extractPass.end();
+
+        // ---- Pass 3: Blur horizontal (bloomTex0 → bloomTex1) ----
+        const bloomW = Math.max(1, w >> 1);
+        const bloomH = Math.max(1, h >> 1);
+        device.queue.writeBuffer(blurDirBuffer, 0, new Float32Array([1.0 / bloomW, 0, 0, 0]));
+        const blurHPass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: bloomTex1.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }],
+        });
+        blurHPass.setPipeline(blurPipeline);
+        blurHPass.setBindGroup(0, blurHBG);
+        blurHPass.draw(3);
+        blurHPass.end();
+
+        // ---- Pass 4: Blur vertical (bloomTex1 → bloomTex0) ----
+        device.queue.writeBuffer(blurDirBuffer, 0, new Float32Array([0, 1.0 / bloomH, 0, 0]));
+        const blurVPass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: bloomTex0.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }],
+        });
+        blurVPass.setPipeline(blurPipeline);
+        blurVPass.setBindGroup(0, blurVBG);
+        blurVPass.draw(3);
+        blurVPass.end();
+
+        // ---- Pass 5: Composite (HDR + bloom → canvas) ----
+        const compositePass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: context.getCurrentTexture().createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }],
+        });
+        compositePass.setPipeline(compositePipeline);
+        compositePass.setBindGroup(0, compositeBG);
+        compositePass.draw(3);
+        compositePass.end();
 
         device.queue.submit([encoder.finish()]);
         requestAnimationFrame(frame);
