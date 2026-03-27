@@ -1,5 +1,6 @@
 import { OrbitCamera, mat4Multiply, mat4Inverse } from "./camera.js";
 import { generateInitialSpectrum } from './spectrum.js';
+import GUI from 'lil-gui';
 
 // ===== Configuration =====
 const N = 256;                              // FFT grid size
@@ -22,6 +23,24 @@ const params = {
     amplitude1: 150,
     amplitude2: 20,
     choppiness: 1.8,
+    timeScale: 1.0,
+    paused: false,
+
+    // Sun
+    sunAzimuth: 31,
+    sunElevation: 56,
+
+    // Atmosphere
+    fogStart: 800,
+    fogEnd: 5000,
+
+    // Clouds
+    cloudCoverage: 0.5,
+    cloudSpeed: 25,
+
+    // Day/Night
+    autoCycle: false,
+    cycleSpeed: 0.02,
 };
 
 // ===== Helper: create a flat grid mesh =====
@@ -297,16 +316,49 @@ async function main() {
         });
     }
 
-    // --- Sun direction ---
+    // --- Sun direction (from params) ---
     function sunDir() {
-        const el = 56 * Math.PI / 180;
-        const az = 31 * Math.PI / 180;
+        const el = params.sunElevation * Math.PI / 180;
+        const az = params.sunAzimuth * Math.PI / 180;
         return [
             Math.cos(el) * Math.sin(az),
             Math.sin(el),
             Math.cos(el) * Math.cos(az),
         ];
     }
+
+    // --- GUI ---
+    const gui = new GUI({ title: 'Ocean Parameters' });
+
+    const specFolder = gui.addFolder('Spectrum (regenerates)');
+    specFolder.add(params, 'windSpeed', 1, 80).onChange(regenerateSpectrum);
+    specFolder.add(params, 'windAngle', 0, 360).name('Wind Angle \u00B0').onChange(regenerateSpectrum);
+
+    const ampFolder = gui.addFolder('Cascade Amplitudes');
+    ampFolder.add(params, 'amplitude0', 0, 2000).name('Swell (1000m)').onChange(regenerateSpectrum);
+    ampFolder.add(params, 'amplitude1', 0, 500).name('Medium (200m)').onChange(regenerateSpectrum);
+    ampFolder.add(params, 'amplitude2', 0, 100).name('Ripple (50m)').onChange(regenerateSpectrum);
+
+    const wavesFolder = gui.addFolder('Waves');
+    wavesFolder.add(params, 'choppiness', 0, 4);
+    wavesFolder.add(params, 'timeScale', 0, 3);
+    wavesFolder.add(params, 'paused');
+
+    const sunFolder = gui.addFolder('Sun');
+    sunFolder.add(params, 'sunAzimuth', 0, 360).name('Azimuth \u00B0');
+    sunFolder.add(params, 'sunElevation', -20, 90).name('Elevation \u00B0');
+
+    const dayFolder = gui.addFolder('Day/Night');
+    dayFolder.add(params, 'autoCycle', ).name('Auto Cycle');
+    dayFolder.add(params, 'cycleSpeed', 0.001, 0.1);
+
+    const atmosFolder = gui.addFolder('Atmosphere');
+    atmosFolder.add(params, 'fogStart', 100, 2000);
+    atmosFolder.add(params, 'fogEnd', 1000, 10000);
+
+    const cloudFolder = gui.addFolder('Clouds');
+    cloudFolder.add(params, 'cloudCoverage', 0, 1);
+    cloudFolder.add(params, 'cloudSpeed', 0, 100);
 
     // ===== Frame loop =====
     let accTime = 0;
@@ -316,7 +368,17 @@ async function main() {
         const now = performance.now();
         const dt = (now - lastTime) / 1000;
         lastTime = now;
-        accTime += dt;
+        if (!params.paused) {
+            accTime += dt * params.timeScale;
+        }
+
+        // Day/night cycle
+        if (params.autoCycle) {
+            params.sunElevation += dt * params.cycleSpeed * 360;
+            if (params.sunElevation > 180) params.sunElevation -= 360;
+            if (params.sunElevation < -180) params.sunElevation += 360;
+            sunFolder.controllers.forEach(c => c.updateDisplay());
+        }
 
         const w = canvas.width;
         const h = canvas.height;
@@ -354,8 +416,8 @@ async function main() {
         f[24] = CASCADE_PATCHES[0]; // 24: cascadePatch0
         f[25] = CASCADE_PATCHES[1]; // 25: cascadePatch1
         f[26] = CASCADE_PATCHES[2]; // 26: cascadePatch2
-        f[27] = 0.5;               // 27: cloudCoverage
-        f[28] = 25;                // 28: cloudSpeed
+        f[27] = params.cloudCoverage; // 27: cloudCoverage
+        f[28] = params.cloudSpeed;    // 28: cloudSpeed
         f[29] = 0;                  // 29: pad1
         f[30] = 0;                  // 30: pad2
         f[31] = 0;                  // 31: pad3
