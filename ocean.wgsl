@@ -381,6 +381,58 @@ fn vs(@location(0) position: vec3f,
     return out;
 }
 
+// ==========================================
+// Underwater caustics
+// ==========================================
+
+fn causticsLayer(p: vec2f) -> f32 {
+    // Create bright network pattern using tiled cells
+    let cell = floor(p);
+    let f = fract(p);
+
+    // Voronoi-like distance field for caustic network
+    var minDist = 1.0;
+    for (var j = -1; j <= 1; j++) {
+        for (var i = -1; i <= 1; i++) {
+            let neighbor = vec2f(f32(i), f32(j));
+            let offset = cell + neighbor;
+            // Random point within each cell
+            let h = fract(sin(vec2f(
+                dot(offset, vec2f(127.1, 311.7)),
+                dot(offset, vec2f(269.5, 183.3))
+            )) * 43758.5453);
+            let diff = neighbor + h - f;
+            let d = length(diff);
+            minDist = min(minDist, d);
+        }
+    }
+    // Sharp bright lines where cells meet
+    return pow(1.0 - smoothstep(0.0, 0.35, minDist), 3.0);
+}
+
+fn caustics(worldPos: vec3f, time: f32, sunDir: vec3f) -> f32 {
+    // Project caustics from sun direction onto ocean floor
+    // Simulate light refracting through waves
+    let scale1 = 0.08;
+    let scale2 = 0.12;
+    let speed = time * 0.8;
+
+    let p1 = worldPos.xz * scale1 + vec2f(speed * 0.3, speed * 0.2);
+    let p2 = worldPos.xz * scale2 + vec2f(-speed * 0.2, speed * 0.35);
+
+    // Two overlapping layers create more complex pattern
+    let c1 = causticsLayer(p1);
+    let c2 = causticsLayer(p2 * 1.3 + 3.7);
+
+    // Combine: multiply for intersection pattern (realistic)
+    let combined = (c1 + c2) * 0.5;
+
+    // Stronger when sun is higher (sunDir.y), dimmer at low sun
+    let sunFactor = clamp(sunDir.y * 1.5, 0.0, 1.0);
+
+    return combined * sunFactor;
+}
+
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
     let N = normalize(inp.normal);
@@ -403,6 +455,15 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     let depthFactor = clamp(NdotV * 0.8 + 0.1, 0.0, 1.0);
     var waterColor = mix(absorpColor, scatterColor, depthFactor);
     waterColor *= (ambientLight + sunIntensity * NdotL * 0.5);
+
+    // ---------- Underwater caustics ----------
+    // Visible when looking steeply into water (high NdotV)
+    // and close to camera (fades with distance)
+    let causticsVal = caustics(inp.worldPos, render.time, L);
+    let causticsDepth = clamp(NdotV - 0.3, 0.0, 1.0);
+    let causticsDist = smoothstep(500.0, 50.0, inp.distToEye);
+    let causticsColor = vec3f(0.15, 0.35, 0.45) * causticsVal * causticsDepth * causticsDist;
+    waterColor += causticsColor;
 
     // ---------- Subsurface scattering ----------
     // Light passing through thin wave crests creates a green/teal glow
