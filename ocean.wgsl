@@ -162,6 +162,81 @@ fn fftColPass(@builtin(local_invocation_id) lid: vec3u,
 }
 
 // ==========================================
+// Step 2b: Foam accumulation
+// Computes Jacobian (wave folding) and accumulates foam over time
+// ==========================================
+
+struct FoamParams {
+    dt: f32,
+    choppiness: f32,
+    patch0: f32,
+    patch1: f32,
+    patch2: f32,
+    decay: f32,
+    bias: f32,      // Jacobian threshold (higher = more foam)
+    scale: f32,     // foam intensity multiplier
+};
+
+@group(0) @binding(0) var<storage, read> foamDxt0: array<vec2f>;
+@group(0) @binding(1) var<storage, read> foamDzt0: array<vec2f>;
+@group(0) @binding(2) var<storage, read> foamDxt1: array<vec2f>;
+@group(0) @binding(3) var<storage, read> foamDzt1: array<vec2f>;
+@group(0) @binding(4) var<storage, read> foamDxt2: array<vec2f>;
+@group(0) @binding(5) var<storage, read> foamDzt2: array<vec2f>;
+@group(0) @binding(6) var<storage, read_write> foamMap: array<f32>;
+@group(0) @binding(7) var<uniform> fParams: FoamParams;
+
+@compute @workgroup_size(16, 16)
+fn foamAccumulate(@builtin(global_invocation_id) id: vec3u) {
+    let col = id.x;
+    let row = id.y;
+    if (col >= 256u || row >= 256u) { return; }
+
+    let idx = row * 256u + col;
+    let chop0 = fParams.choppiness;
+    let chop1 = fParams.choppiness * 0.5;
+    let chop2 = fParams.choppiness * 0.15;
+
+    // Neighbor indices (wrapping)
+    let l = row * 256u + ((col + 255u) % 256u);
+    let r = row * 256u + ((col + 1u) % 256u);
+    let u = ((row + 255u) % 256u) * 256u + col;
+    let d = ((row + 1u) % 256u) * 256u + col;
+
+    // Cascade 0 Jacobian — measures surface compression
+    // When Jacobian < 0, the wave has folded over itself → foam
+    let inv0 = 256.0 / (2.0 * fParams.patch0);
+    let ddxdx0 = (foamDxt0[r].x * -chop0 - foamDxt0[l].x * -chop0) * inv0;
+    let ddzdz0 = (foamDzt0[d].x * -chop0 - foamDzt0[u].x * -chop0) * inv0;
+    let jac0 = (1.0 + ddxdx0) * (1.0 + ddzdz0);
+
+    // Cascade 1 Jacobian
+    let inv1 = 256.0 / (2.0 * fParams.patch1);
+    let ddxdx1 = (foamDxt1[r].x * -chop1 - foamDxt1[l].x * -chop1) * inv1;
+    let ddzdz1 = (foamDzt1[d].x * -chop1 - foamDzt1[u].x * -chop1) * inv1;
+    let jac1 = (1.0 + ddxdx1) * (1.0 + ddzdz1);
+
+    // Cascade 2 Jacobian
+    let inv2 = 256.0 / (2.0 * fParams.patch2);
+    let ddxdx2 = (foamDxt2[r].x * -chop2 - foamDxt2[l].x * -chop2) * inv2;
+    let ddzdz2 = (foamDzt2[d].x * -chop2 - foamDzt2[u].x * -chop2) * inv2;
+    let jac2 = (1.0 + ddxdx2) * (1.0 + ddzdz2);
+
+    // Generate foam where Jacobian goes negative (wave folding)
+    // bias controls threshold, scale controls intensity
+    let foam0 = clamp((-jac0 + fParams.bias) * fParams.scale, 0.0, 1.0);
+    let foam1 = clamp((-jac1 + fParams.bias * 0.9) * fParams.scale * 1.3, 0.0, 1.0) * 0.6;
+    let foam2 = clamp((-jac2 + fParams.bias * 0.8) * fParams.scale * 1.6, 0.0, 1.0) * 0.3;
+    let generated = min(foam0 + foam1 + foam2, 1.0);
+
+    // Decay existing foam, keep maximum of decayed and new
+    let existing = foamMap[idx];
+    let decayed = existing * exp(-fParams.decay * fParams.dt);
+
+    foamMap[idx] = max(decayed, generated);
+}
+
+// ==========================================
 // Step 3: Render the ocean surface
 // ==========================================
 
@@ -195,6 +270,8 @@ struct RenderUniforms {
 @group(0) @binding(8) var<storage, read> ht2: array<vec2f>;
 @group(0) @binding(9) var<storage, read> dxt2: array<vec2f>;
 @group(0) @binding(10) var<storage, read> dzt2: array<vec2f>;
+// Accumulated foam map from compute pass
+@group(0) @binding(11) var<storage, read> renderFoamMap: array<f32>;
 
 // Look up FFT index from world position
 fn cascadeIdx(wx: f32, wz: f32, patchSize: f32) -> u32 {
@@ -223,6 +300,7 @@ struct VsOut {
     @location(0) worldPos: vec3f,
     @location(1) normal: vec3f,
     @location(2) distToEye: f32,
+    @location(3) foam: f32,
 };
 
 @vertex
@@ -254,33 +332,49 @@ fn vs(@location(0) position: vec3f,
 
     let displaced = vec3f(worldX + dx, h, worldZ + dz);
 
-    // --- Normal calculation ---
-    // Sample neighbors to get slopes (dh/dx, dh/dz)
-    var dhdx: f32 = 0.0;
-    var dhdz: f32 = 0.0;
+    // --- Normal calculation (with displacement gradients like OceanGpu) ---
+    var totalDhDx: f32 = 0.0;
+    var totalDhDz: f32 = 0.0;
+    var totalDdxDx: f32 = 0.0;
+    var totalDdzDz: f32 = 0.0;
 
-    // Cascade 0 slope
+    // Cascade 0 slopes + displacement gradients
     let s0 = render.cascadePatch0 / 256.0;
-    dhdx += (ht0[ci0.r].x - ht0[ci0.l].x) / (2.0 * s0);
-    dhdz += (ht0[ci0.d].x - ht0[ci0.u].x) / (2.0 * s0);
+    let inv0 = 1.0 / (2.0 * s0);
+    totalDhDx += (ht0[ci0.r].x - ht0[ci0.l].x) * inv0;
+    totalDhDz += (ht0[ci0.d].x - ht0[ci0.u].x) * inv0;
+    totalDdxDx += (dxt0[ci0.r].x * -chop0 - dxt0[ci0.l].x * -chop0) * inv0;
+    totalDdzDz += (dzt0[ci0.d].x * -chop0 - dzt0[ci0.u].x * -chop0) * inv0;
 
-    // Cascade 1 slope
+    // Cascade 1
     let s1 = render.cascadePatch1 / 256.0;
-    dhdx += (ht1[ci1.r].x - ht1[ci1.l].x) / (2.0 * s1);
-    dhdz += (ht1[ci1.d].x - ht1[ci1.u].x) / (2.0 * s1);
+    let inv1 = 1.0 / (2.0 * s1);
+    totalDhDx += (ht1[ci1.r].x - ht1[ci1.l].x) * inv1;
+    totalDhDz += (ht1[ci1.d].x - ht1[ci1.u].x) * inv1;
+    totalDdxDx += (dxt1[ci1.r].x * -chop1 - dxt1[ci1.l].x * -chop1) * inv1;
+    totalDdzDz += (dzt1[ci1.d].x * -chop1 - dzt1[ci1.u].x * -chop1) * inv1;
 
-    // Cascade 2 slope
+    // Cascade 2
     let s2 = render.cascadePatch2 / 256.0;
-    dhdx += (ht2[ci2.r].x - ht2[ci2.l].x) / (2.0 * s2);
-    dhdz += (ht2[ci2.d].x - ht2[ci2.u].x) / (2.0 * s2);
+    let inv2 = 1.0 / (2.0 * s2);
+    totalDhDx += (ht2[ci2.r].x - ht2[ci2.l].x) * inv2;
+    totalDhDz += (ht2[ci2.d].x - ht2[ci2.u].x) * inv2;
+    totalDdxDx += (dxt2[ci2.r].x * -chop2 - dxt2[ci2.l].x * -chop2) * inv2;
+    totalDdzDz += (dzt2[ci2.d].x * -chop2 - dzt2[ci2.u].x * -chop2) * inv2;
 
-    // Normal = cross product of tangent vectors
-    let normal = normalize(vec3f(-dhdx, 1.0, -dhdz));
+    // Normal from tangent cross product (accounts for choppiness)
+    let tangentX = vec3f(1.0 + totalDdxDx, totalDhDx, 0.0);
+    let tangentZ = vec3f(0.0, totalDhDz, 1.0 + totalDdzDz);
+    let normal = normalize(cross(tangentZ, tangentX));
+
+    // Sample accumulated foam from compute pass
+    let foamAmount = renderFoamMap[ci0.c];
 
     var out: VsOut;
     out.worldPos = displaced;
     out.normal = normal;
     out.distToEye = length(displaced.xz - render.eyePos.xz);
+    out.foam = foamAmount;
     out.pos = render.viewProj * vec4f(displaced, 1.0);
     return out;
 }
@@ -317,8 +411,14 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     let spec = pow(NdotH, 256.0) * 3.0;  // sharp sun reflection
     let specColor = vec3f(1.0, 0.95, 0.85) * spec;
 
+    // --- Foam ---
+    let foam = inp.foam;
+    let foamColor = vec3f(0.9, 0.92, 0.95) * (vec3f(0.6) + vec3f(0.4) * NdotL);
+    let foamMask = smoothstep(0.0, 0.4, foam);
+
     // --- Combine ---
     var color = mix(waterColor, reflectSky, fresnel) + specColor;
+    color = mix(color, foamColor, foamMask * 0.85);
 
     // --- Distance fog (matches sky horizon) ---
     let fogFactor = clamp((inp.distToEye - 800.0) / 4200.0, 0.0, 1.0);

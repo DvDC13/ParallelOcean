@@ -38,6 +38,11 @@ const params = {
     cloudCoverage: 0.5,
     cloudSpeed: 25,
 
+    // Foam
+    foamBias: 1.0,
+    foamScale: 1.5,
+    foamDecay: 0.5,
+
     // Day/Night
     autoCycle: false,
     cycleSpeed: 0.02,
@@ -244,6 +249,37 @@ async function main() {
         dzt: createFFTBindGroups(c.dztBuf),
     }));
 
+    // --- Foam accumulation ---
+    const foamMapBuffer = device.createBuffer({
+        size: N * N * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(foamMapBuffer, 0, new Float32Array(N * N));
+
+    const foamParamsBuffer = device.createBuffer({
+        size: 32, // FoamParams: 8 floats
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const foamAccumPipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: shaderModule, entryPoint: 'foamAccumulate' },
+    });
+
+    const foamAccumBG = device.createBindGroup({
+        layout: foamAccumPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: cascades[0].dxtBuf } },
+            { binding: 1, resource: { buffer: cascades[0].dztBuf } },
+            { binding: 2, resource: { buffer: cascades[1].dxtBuf } },
+            { binding: 3, resource: { buffer: cascades[1].dztBuf } },
+            { binding: 4, resource: { buffer: cascades[2].dxtBuf } },
+            { binding: 5, resource: { buffer: cascades[2].dztBuf } },
+            { binding: 6, resource: { buffer: foamMapBuffer } },
+            { binding: 7, resource: { buffer: foamParamsBuffer } },
+        ],
+    });
+
     // --- Render pipeline (draws the ocean triangles) ---
     // Uniform buffer: 128 bytes (matches RenderUniforms in shader)
     const renderUniformBuf = device.createBuffer({
@@ -288,6 +324,7 @@ async function main() {
             { binding: 8,  resource: { buffer: cascades[2].htBuf } },
             { binding: 9,  resource: { buffer: cascades[2].dxtBuf } },
             { binding: 10, resource: { buffer: cascades[2].dztBuf } },
+            { binding: 11, resource: { buffer: foamMapBuffer } },
         ],
     });
 
@@ -478,6 +515,11 @@ async function main() {
     const wavesFolder = gui.addFolder('Waves');
     wavesFolder.add(params, 'choppiness', 0, 4);
     wavesFolder.add(params, 'timeScale', 0, 3);
+
+    const foamFolder = gui.addFolder('Foam');
+    foamFolder.add(params, 'foamBias', 0, 2, 0.05).name('Bias (threshold)');
+    foamFolder.add(params, 'foamScale', 0, 5, 0.1).name('Scale (intensity)');
+    foamFolder.add(params, 'foamDecay', 0.1, 3, 0.05).name('Decay (fade speed)');
     wavesFolder.add(params, 'paused');
 
     const sunFolder = gui.addFolder('Sun');
@@ -610,6 +652,24 @@ async function main() {
             }
         }
         comp.end();
+
+        // Foam accumulation compute pass (runs after FFT)
+        const foamData = new Float32Array(8);
+        foamData[0] = dt;                   // dt
+        foamData[1] = params.choppiness;    // choppiness
+        foamData[2] = CASCADE_PATCHES[0];   // patch0
+        foamData[3] = CASCADE_PATCHES[1];   // patch1
+        foamData[4] = CASCADE_PATCHES[2];   // patch2
+        foamData[5] = params.foamDecay;     // decay rate
+        foamData[6] = params.foamBias;      // bias (threshold)
+        foamData[7] = params.foamScale;     // scale (intensity)
+        device.queue.writeBuffer(foamParamsBuffer, 0, foamData);
+
+        const foamPass = encoder.beginComputePass();
+        foamPass.setPipeline(foamAccumPipeline);
+        foamPass.setBindGroup(0, foamAccumBG);
+        foamPass.dispatchWorkgroups(Math.ceil(N / 16), Math.ceil(N / 16));
+        foamPass.end();
 
         // ---- Pass 1: Render scene → HDR texture ----
         const renderPass = encoder.beginRenderPass({
