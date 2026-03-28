@@ -301,6 +301,7 @@ struct VsOut {
     @location(1) normal: vec3f,
     @location(2) distToEye: f32,
     @location(3) foam: f32,
+    @location(4) waveHeight: f32,
 };
 
 @vertex
@@ -375,6 +376,7 @@ fn vs(@location(0) position: vec3f,
     out.normal = normal;
     out.distToEye = length(displaced.xz - render.eyePos.xz);
     out.foam = foamAmount;
+    out.waveHeight = h;
     out.pos = render.viewProj * vec4f(displaced, 1.0);
     return out;
 }
@@ -384,45 +386,74 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     let N = normalize(inp.normal);
     let V = normalize(render.eyePos - inp.worldPos);
     let L = normalize(render.sunDir);
-
-    // How much surface faces the camera / sun
     let NdotV = max(dot(N, V), 0.001);
     let NdotL = max(dot(N, L), 0.0);
 
-    // --- Fresnel effect ---
-    // At steep angles: see into the water (blue)
-    // At shallow angles: see sky reflection
+    // Sun light intensity
+    let sunIntensity = vec3f(3.5, 3.2, 2.8);
+    let ambientLight = vec3f(0.5, 0.6, 0.85);
+
+    // ---------- Fresnel (Schlick) ----------
     let F0: f32 = 0.02;
     let fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
 
-    // --- Deep water color ---
-    let deepColor = vec3f(0.01, 0.05, 0.15);    // dark blue
-    let shallowColor = vec3f(0.04, 0.20, 0.35);  // lighter teal
-    var waterColor = mix(deepColor, shallowColor, NdotV);
-    waterColor *= (0.6 + 0.4 * NdotL);  // basic lighting
+    // ---------- Water absorption color ----------
+    let absorpColor = vec3f(0.02, 0.08, 0.18);
+    let scatterColor = vec3f(0.06, 0.28, 0.42);
+    let depthFactor = clamp(NdotV * 0.8 + 0.1, 0.0, 1.0);
+    var waterColor = mix(absorpColor, scatterColor, depthFactor);
+    waterColor *= (ambientLight + sunIntensity * NdotL * 0.5);
 
-    // --- Sky reflection (use actual sky color) ---
+    // ---------- Subsurface scattering ----------
+    // Light passing through thin wave crests creates a green/teal glow
+    let sssDir = normalize(L + N * 0.4);
+    let sssDot = pow(clamp(dot(V, -sssDir), 0.0, 1.0), 5.0);
+    let sssHeight = clamp(inp.waveHeight * 0.1, 0.0, 1.0);
+    let sssIntensity = sssDot * sssHeight * 0.3;
+    let sssColor = vec3f(0.02, 0.18, 0.12) * sssIntensity * sunIntensity;
+
+    // Forward scattering — glow when looking toward the sun
+    let viewSunDot = max(dot(-V, L), 0.0);
+    let forwardSSS = pow(viewSunDot, 6.0) * 0.03 * vec3f(0.02, 0.12, 0.08);
+
+    // ---------- Sky / environment reflection ----------
     let R = reflect(-V, N);
-    let reflectSky = skyColor(R, render.sunDir, render.time);
+    let envColor = skyColor(R, render.sunDir, render.time);
 
-    // --- Sun specular highlight ---
+    // ---------- Sun specular (dual-lobe GGX) ----------
     let H = normalize(L + V);
     let NdotH = max(dot(N, H), 0.0);
-    let spec = pow(NdotH, 256.0) * 3.0;  // sharp sun reflection
-    let specColor = vec3f(1.0, 0.95, 0.85) * spec;
 
-    // --- Foam ---
+    // Sharp lobe — tight sun disk reflection
+    let roughSharp = 0.04;
+    let a2s = roughSharp * roughSharp;
+    let denomS = NdotH * NdotH * (a2s - 1.0) + 1.0;
+    let Ds = a2s / (PI * denomS * denomS);
+    let specSharp = Ds * fresnel * NdotL * 3.0;
+
+    // Broad lobe — wide glitter around sun
+    let roughBroad = 0.25;
+    let a2b = roughBroad * roughBroad;
+    let denomB = NdotH * NdotH * (a2b - 1.0) + 1.0;
+    let Db = a2b / (PI * denomB * denomB);
+    let specBroad = Db * fresnel * NdotL * 0.8;
+
+    let sunColor = vec3f(1.0, 0.95, 0.85);
+    let specTotal = sunColor * sunIntensity * (specSharp + specBroad);
+
+    // ---------- Foam ----------
     let foam = inp.foam;
-    let foamColor = vec3f(0.9, 0.92, 0.95) * (vec3f(0.6) + vec3f(0.4) * NdotL);
+    let foamColor = vec3f(0.9, 0.92, 0.95) * (ambientLight + sunIntensity * max(NdotL, 0.3));
     let foamMask = smoothstep(0.0, 0.4, foam);
 
-    // --- Combine ---
-    var color = mix(waterColor, reflectSky, fresnel) + specColor;
+    // ---------- Composite ----------
+    var color = mix(waterColor, envColor, fresnel) + sssColor + forwardSSS + specTotal;
     color = mix(color, foamColor, foamMask * 0.85);
 
-    // --- Distance fog (matches sky horizon) ---
+    // ---------- Distance fog ----------
     let fogFactor = clamp((inp.distToEye - 800.0) / 4200.0, 0.0, 1.0);
-    let fogColor = skyColor(vec3f(0.0, 0.02, 1.0), render.sunDir, render.time);
+    let viewDir = normalize(inp.worldPos - render.eyePos);
+    let fogColor = skyColor(viewDir, render.sunDir, render.time);
     color = mix(color, fogColor, fogFactor * fogFactor);
 
     return vec4f(color, 1.0);
