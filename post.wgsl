@@ -13,10 +13,11 @@ struct PostParams {
     rainIntensity: f32,      // 32-35
     lightningFlash: f32,     // 36-39
     time: f32,               // 40-43
-    sunScreenX: f32,         // 44-47
-    sunScreenY: f32,         // 48-51
-    godRayStrength: f32,     // 52-55
-    _pad: f32,               // 56-59 (pad to 16-byte alignment)
+    cameraY: f32,            // 44-47
+    waterLevel: f32,         // 48-51
+    sunScreenX: f32,         // 52-55
+    sunScreenY: f32,         // 56-59
+    godRayStrength: f32,     // 60-63
 };
 
 struct RainCamera {
@@ -202,6 +203,144 @@ fn godRays(uv: vec2f, sunUV: vec2f, strength: f32) -> vec3f {
 }
 
 // ==========================================
+// Underwater effect
+// ==========================================
+
+fn underwaterHash(p: vec2f) -> f32 {
+    return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+}
+
+fn underwaterNoise(p: vec2f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = underwaterHash(i);
+    let b = underwaterHash(i + vec2f(1.0, 0.0));
+    let c = underwaterHash(i + vec2f(0.0, 1.0));
+    let d = underwaterHash(i + vec2f(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Sharp caustic network — thin bright lines like real refracted light
+fn underwaterCaustics(uv: vec2f, time: f32) -> f32 {
+    var c = 0.0;
+    for (var layer = 0; layer < 2; layer++) {
+        let fl = f32(layer);
+        let scale = 15.0 + fl * 10.0;
+        let speed = vec2f(0.3 + fl * 0.15, 0.2 - fl * 0.1);
+        let p = uv * scale + time * speed + fl * vec2f(50.0, 30.0);
+
+        // Voronoi edge detection — bright on cell boundaries
+        let cell = floor(p);
+        var minDist1 = 10.0;
+        var minDist2 = 10.0;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let neighbor = cell + vec2f(f32(dx), f32(dy));
+                let point = neighbor + vec2f(
+                    underwaterHash(neighbor + fl * 7.1),
+                    underwaterHash(neighbor + vec2f(37.0, 17.0) + fl * 13.3)
+                );
+                let d = length(point - p);
+                if (d < minDist1) {
+                    minDist2 = minDist1;
+                    minDist1 = d;
+                } else if (d < minDist2) {
+                    minDist2 = d;
+                }
+            }
+        }
+        let edge = minDist2 - minDist1;
+        c += pow(smoothstep(0.15, 0.0, edge), 2.0);
+    }
+    return c * 0.5;
+}
+
+// Floating particles (plankton/dust)
+fn underwaterParticles(uv: vec2f, time: f32) -> f32 {
+    var total = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let fi = f32(i);
+        let scale = 20.0 + fi * 15.0;
+        let speed = vec2f(0.02 + fi * 0.01, -0.05 - fi * 0.02);
+        let p = uv * scale + time * speed + fi * vec2f(17.3, 31.7);
+        let cell = floor(p);
+        let f = fract(p);
+        let rnd = vec2f(
+            underwaterHash(cell + fi * 7.1),
+            underwaterHash(cell + fi * 7.1 + vec2f(0.0, 53.0))
+        );
+        let dist = length(f - rnd);
+        let size = 0.03 + underwaterHash(cell + fi * 3.3) * 0.06;
+        let dot_val = smoothstep(size, size * 0.3, dist);
+        let twinkle = sin(time * (2.0 + fi) + underwaterHash(cell) * 6.28) * 0.5 + 0.5;
+        total += dot_val * twinkle * (0.4 + fi * 0.15);
+    }
+    return clamp(total, 0.0, 1.0);
+}
+
+fn underwaterEffect(color: vec3f, uv: vec2f, time: f32, depth: f32) -> vec3f {
+    let depthFactor = clamp(depth * 0.04, 0.0, 1.0);
+    let up = 1.0 - uv.y;
+
+    // Strong vertical gradient: bright teal at top, deep blue at bottom
+    let brightColor = vec3f(0.02, 0.18, 0.25);
+    let darkColor = vec3f(0.005, 0.03, 0.06);
+    var result = mix(darkColor, brightColor, pow(up, 0.8));
+    result *= mix(1.0, 0.3, depthFactor);
+
+    // Visible surface from below: bright wavy zone at top
+    let surfaceZone = pow(smoothstep(0.5, 0.95, up), 1.5);
+    let w1 = sin(uv.x * 15.0 + time * 1.5) * 0.5 + 0.5;
+    let w2 = sin(uv.x * 25.0 - time * 1.0 + 2.3) * 0.5 + 0.5;
+    let w3 = sin(uv.x * 8.0 + time * 0.7 + 1.1) * 0.5 + 0.5;
+    let wavePattern = w1 * 0.4 + w2 * 0.3 + w3 * 0.3;
+    let surfaceLight = surfaceZone * (0.6 + wavePattern * 0.4);
+    result += vec3f(0.12, 0.35, 0.4) * surfaceLight * (1.0 - depthFactor * 0.5);
+    let highlights = pow(w1 * w2, 1.5) * surfaceZone;
+    result += vec3f(0.2, 0.4, 0.35) * highlights * (1.0 - depthFactor);
+
+    // God rays: diagonal light shafts
+    let rayAngle = 0.45;
+    let cosA = cos(rayAngle);
+    let sinA = sin(rayAngle);
+    let ru = uv.x * cosA + (1.0 - uv.y) * sinA;
+    var rayTotal = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let fi = f32(i);
+        let center = 0.15 + fi * 0.22 + sin(time * 0.1 + fi * 2.0) * 0.03;
+        let width = 0.04 + fi * 0.01;
+        let beam = exp(-pow((ru - center) / width, 2.0));
+        rayTotal += beam * (0.7 + fi * 0.1);
+    }
+    rayTotal *= smoothstep(0.0, 0.7, up);
+    let rn = underwaterNoise(vec2f(ru * 4.0 + time * 0.05, up * 3.0));
+    rayTotal *= 0.7 + rn * 0.3;
+    result += vec3f(0.05, 0.15, 0.18) * rayTotal * (1.0 - depthFactor * 0.5);
+
+    // Caustics: subtle, only near surface
+    let caustics = underwaterCaustics(uv, time);
+    let causticsNearSurface = pow(up, 3.0) * (1.0 - depthFactor);
+    result += vec3f(0.01, 0.02, 0.02) * caustics * causticsNearSurface;
+
+    // Tiny floating particles
+    let particles = underwaterParticles(uv, time);
+    result += vec3f(0.08, 0.1, 0.09) * particles * 0.3;
+
+    // Blend in some original scene (fish, objects)
+    let lum = dot(color, vec3f(0.299, 0.587, 0.114));
+    let sceneTinted = color * vec3f(0.3, 0.7, 0.8);
+    let sceneVis = min(lum * 2.0, 1.0) * mix(0.6, 0.15, depthFactor);
+    result = mix(result, result + sceneTinted * 0.4, sceneVis);
+
+    // Soft vignette
+    let vig = 1.0 - smoothstep(0.6, 1.4, length((uv - 0.5) * 1.5)) * 0.3;
+    result *= vig;
+
+    return result;
+}
+
+// ==========================================
 // Pass 4: Final composite
 // ==========================================
 @group(0) @binding(0) var sceneTex: texture_2d<f32>;
@@ -212,59 +351,80 @@ fn godRays(uv: vec2f, sunUV: vec2f, strength: f32) -> vec3f {
 
 @fragment
 fn compositeFs(inp: PostVsOut) -> @location(0) vec4f {
-    var color = textureSample(sceneTex, compositeSampler, inp.uv).rgb;
-    let bloom = textureSample(bloomTex, compositeSampler, inp.uv).rgb;
+    // Underwater detection
+    let isUnderwater = postUniforms.cameraY < postUniforms.waterLevel;
+    let underwaterDepth = select(0.0, postUniforms.waterLevel - postUniforms.cameraY, isUnderwater);
 
-    // Lightning flash — boost scene brightness
-    let flash = postUniforms.lightningFlash;
-    color += color * flash * 3.0;
-    color += vec3f(0.6, 0.65, 0.8) * flash;
+    // Underwater UV distortion — wavering view
+    var sampleUV = inp.uv;
+    if (isUnderwater) {
+        let t = postUniforms.time;
+        sampleUV.x += sin(inp.uv.y * 25.0 + t * 1.5) * 0.006;
+        sampleUV.y += cos(inp.uv.x * 20.0 + t * 1.2) * 0.004;
+    }
 
-    // Add bloom
-    color += bloom * postUniforms.bloomStrength;
+    var color = textureSample(sceneTex, compositeSampler, sampleUV).rgb;
+    let bloom = textureSample(bloomTex, compositeSampler, sampleUV).rgb;
 
-    // God rays — radial light shafts from sun
-    let sunUV = vec2f(postUniforms.sunScreenX, postUniforms.sunScreenY);
-    let rays = godRays(inp.uv, sunUV, postUniforms.godRayStrength);
-    color += rays;
+    if (isUnderwater) {
+        // UNDERWATER: apply early, before bloom/tonemapping can wash it out
+        color = underwaterEffect(color, inp.uv, postUniforms.time, underwaterDepth);
+        color *= 2.5;
+        color = color / (color + vec3f(1.0));
+    } else {
+        // Lightning flash — boost scene brightness
+        let flash = postUniforms.lightningFlash;
+        color += color * flash * 3.0;
+        color += vec3f(0.6, 0.65, 0.8) * flash;
 
-    // Exposure
-    color *= postUniforms.exposure;
+        // Add bloom
+        color += bloom * postUniforms.bloomStrength;
 
-    // ACES tonemap
-    let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
-    color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0.0), vec3f(1.0));
+        // God rays — radial light shafts from sun
+        let sunUV = vec2f(postUniforms.sunScreenX, postUniforms.sunScreenY);
+        let rays = godRays(inp.uv, sunUV, postUniforms.godRayStrength);
+        color += rays;
 
-    // Contrast
-    let midpoint = vec3f(0.5);
-    color = midpoint + (color - midpoint) * postUniforms.contrast;
-    color = clamp(color, vec3f(0.0), vec3f(1.0));
+        // Exposure
+        color *= postUniforms.exposure;
 
-    // Saturation
-    let gray = dot(color, vec3f(0.2126, 0.7152, 0.0722));
-    color = mix(vec3f(gray), color, postUniforms.saturation);
+        // ACES tonemap
+        let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
+        color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0.0), vec3f(1.0));
 
-    // Rain
-    let ri = postUniforms.rainIntensity;
-    let mistGrey = vec3f(0.45, 0.48, 0.52);
-    color = mix(color, mistGrey, ri * 0.18);
-    let rainStreaks = rainEffect(inp.uv, postUniforms.time, ri, rainCamera.eyePos.xyz);
-    color += rainStreaks;
-    let rainDesat = 1.0 - ri * 0.1;
-    let grayR = dot(color, vec3f(0.2126, 0.7152, 0.0722));
-    color = mix(vec3f(grayR), color, rainDesat);
+        // Contrast
+        let midpoint = vec3f(0.5);
+        color = midpoint + (color - midpoint) * postUniforms.contrast;
+        color = clamp(color, vec3f(0.0), vec3f(1.0));
+
+        // Saturation
+        let gray = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+        color = mix(vec3f(gray), color, postUniforms.saturation);
+
+        // Rain
+        let ri = postUniforms.rainIntensity;
+        let mistGrey = vec3f(0.45, 0.48, 0.52);
+        color = mix(color, mistGrey, ri * 0.18);
+        let rainStreaks = rainEffect(inp.uv, postUniforms.time, ri, rainCamera.eyePos.xyz);
+        color += rainStreaks;
+        let rainDesat = 1.0 - ri * 0.1;
+        let grayR = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+        color = mix(vec3f(grayR), color, rainDesat);
+    }
 
     // Vignette (stronger during storm)
     let vuv = inp.uv * 2.0 - 1.0;
     let aspect = postUniforms.resolution.x / postUniforms.resolution.y;
     let dist = length(vuv * vec2f(1.0, 1.0 / aspect));
-    let vigStr = postUniforms.vignetteStrength + postUniforms.rainIntensity * 0.2;
+    let vigStr = postUniforms.vignetteStrength + select(postUniforms.rainIntensity * 0.2, 0.0, isUnderwater);
     let vignette = 1.0 - smoothstep(0.5, 1.5, dist) * vigStr;
     color *= vignette;
 
-    // Lightning flash overlay (white flash on top of everything)
-    let flashOverlay = postUniforms.lightningFlash;
-    color = mix(color, vec3f(0.9, 0.92, 0.95), flashOverlay * 0.15);
+    // Lightning flash overlay — not underwater
+    if (!isUnderwater) {
+        let flashOverlay = postUniforms.lightningFlash;
+        color = mix(color, vec3f(0.9, 0.92, 0.95), flashOverlay * 0.15);
+    }
 
     return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), 1.0);
 }

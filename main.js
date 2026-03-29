@@ -51,6 +51,9 @@ const params = {
     rainIntensity: 0.0,
     lightningFreq: 0.0,
 
+    // Wireframe
+    wireframe: false,
+
     // Post-processing
     bloomStrength: 0.25,
     bloomThreshold: 1.5,
@@ -291,46 +294,54 @@ async function main() {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    const renderPipeline = device.createRenderPipeline({
-        layout: 'auto',
-        vertex: {
-            module: shaderModule,
-            entryPoint: 'vs',
-            buffers: [{
-                arrayStride: 12,  // 3 floats * 4 bytes
-                attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
-            }],
-        },
-        fragment: {
-            module: shaderModule,
-            entryPoint: 'fs',
-            targets: [{ format: hdrFormat }],
-        },
-        primitive: { topology: 'triangle-list', cullMode: 'none' },
-        depthStencil: {
-            format: 'depth24plus',
-            depthWriteEnabled: true,
-            depthCompare: 'less',
-        },
-    });
+    function createRenderPipeline(wireframe) {
+        return device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: shaderModule,
+                entryPoint: 'vs',
+                buffers: [{
+                    arrayStride: 12,  // 3 floats * 4 bytes
+                    attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+                }],
+            },
+            fragment: {
+                module: shaderModule,
+                entryPoint: 'fs',
+                targets: [{ format: hdrFormat }],
+            },
+            primitive: { topology: wireframe ? 'line-list' : 'triangle-list', cullMode: 'none' },
+            depthStencil: {
+                format: 'depth24plus',
+                depthWriteEnabled: true,
+                depthCompare: 'less',
+            },
+        });
+    }
 
-    const renderBG = device.createBindGroup({
-        layout: renderPipeline.getBindGroupLayout(0),
-        entries: [
-            { binding: 0,  resource: { buffer: renderUniformBuf } },
-            { binding: 1,  resource: { buffer: cascades[0].htBuf } },
-            { binding: 2,  resource: { buffer: cascades[0].dxtBuf } },
-            { binding: 3,  resource: { buffer: cascades[0].dztBuf } },
-            { binding: 4,  resource: { buffer: tileOffsetsBuffer } },
-            { binding: 5,  resource: { buffer: cascades[1].htBuf } },
-            { binding: 6,  resource: { buffer: cascades[1].dxtBuf } },
-            { binding: 7,  resource: { buffer: cascades[1].dztBuf } },
-            { binding: 8,  resource: { buffer: cascades[2].htBuf } },
-            { binding: 9,  resource: { buffer: cascades[2].dxtBuf } },
-            { binding: 10, resource: { buffer: cascades[2].dztBuf } },
-            { binding: 11, resource: { buffer: foamMapBuffer } },
-        ],
-    });
+    let renderPipeline = createRenderPipeline(params.wireframe);
+
+    function createRenderBindGroup() {
+        return device.createBindGroup({
+            layout: renderPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0,  resource: { buffer: renderUniformBuf } },
+                { binding: 1,  resource: { buffer: cascades[0].htBuf } },
+                { binding: 2,  resource: { buffer: cascades[0].dxtBuf } },
+                { binding: 3,  resource: { buffer: cascades[0].dztBuf } },
+                { binding: 4,  resource: { buffer: tileOffsetsBuffer } },
+                { binding: 5,  resource: { buffer: cascades[1].htBuf } },
+                { binding: 6,  resource: { buffer: cascades[1].dxtBuf } },
+                { binding: 7,  resource: { buffer: cascades[1].dztBuf } },
+                { binding: 8,  resource: { buffer: cascades[2].htBuf } },
+                { binding: 9,  resource: { buffer: cascades[2].dxtBuf } },
+                { binding: 10, resource: { buffer: cascades[2].dztBuf } },
+                { binding: 11, resource: { buffer: foamMapBuffer } },
+            ],
+        });
+    }
+
+    let renderBG = createRenderBindGroup();
 
     // --- Sky pipeline ---
     const invViewProjBuf = device.createBuffer({
@@ -598,6 +609,12 @@ async function main() {
     stormFolder.add(presets, 'storm').name('\u26C8 Storm Preset');
     stormFolder.add(presets, 'calm').name('\u2600 Calm Preset');
 
+    const debugFolder = gui.addFolder('Debug');
+    debugFolder.add(params, 'wireframe').name('Wireframe').onChange(() => {
+        renderPipeline = createRenderPipeline(params.wireframe);
+        renderBG = createRenderBindGroup();
+    });
+
     const postFolder = gui.addFolder('Post-Processing');
     postFolder.add(params, 'bloomStrength', 0, 1).name('Bloom Strength');
     postFolder.add(params, 'bloomThreshold', 0.5, 5).name('Bloom Threshold');
@@ -714,10 +731,11 @@ async function main() {
         postData[8] = params.rainIntensity;
         postData[9] = lightningFlash;
         postData[10] = accTime;                   // time
-        postData[11] = sunUV ? sunUV[0] : -10;   // sunScreenX
-        postData[12] = sunUV ? sunUV[1] : -10;   // sunScreenY
-        postData[13] = sunUV ? params.godRayStrength : 0;
-        postData[14] = 0;                         // pad
+        postData[11] = eye[1];                    // cameraY
+        postData[12] = 0;                         // waterLevel
+        postData[13] = sunUV ? sunUV[0] : -10;   // sunScreenX
+        postData[14] = sunUV ? sunUV[1] : -10;   // sunScreenY
+        postData[15] = sunUV ? params.godRayStrength : 0; // godRayStrength
         device.queue.writeBuffer(postParamsBuffer, 0, postData);
 
         // Upload rain camera data: invViewProj(64) + viewProj(64) + eyePos(16) = 144 bytes
