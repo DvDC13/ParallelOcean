@@ -10,10 +10,19 @@ struct PostParams {
     contrast: f32,           // 20-23
     saturation: f32,         // 24-27
     vignetteStrength: f32,   // 28-31
-    time: f32,               // 32-35
-    sunScreenX: f32,         // 36-39
-    sunScreenY: f32,         // 40-43
-    godRayStrength: f32,     // 44-47
+    rainIntensity: f32,      // 32-35
+    lightningFlash: f32,     // 36-39
+    time: f32,               // 40-43
+    sunScreenX: f32,         // 44-47
+    sunScreenY: f32,         // 48-51
+    godRayStrength: f32,     // 52-55
+    _pad: f32,               // 56-59 (pad to 16-byte alignment)
+};
+
+struct RainCamera {
+    invViewProj: mat4x4f,
+    viewProj: mat4x4f,
+    eyePos: vec4f,
 };
 
 // ---- Fullscreen triangle vertex shader (shared by all post passes) ----
@@ -79,6 +88,79 @@ fn blurFs(inp: PostVsOut) -> @location(0) vec4f {
 }
 
 // ==========================================
+// 3D Rain effect — camera-aware with parallax
+// ==========================================
+
+fn rainHash(p: vec2f) -> f32 {
+    return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
+}
+
+fn rainLayer(
+    uv: vec2f,
+    eyePos: vec3f,
+    time: f32,
+    scaleX: f32,
+    scaleY: f32,
+    speed: f32,
+    parallax: f32,
+    tilt: f32,
+    brightness: f32
+) -> f32 {
+    var p = vec2f(uv.x * scaleX, uv.y * scaleY);
+
+    // Camera parallax — shifts layers at different rates for depth
+    p.x += eyePos.x * parallax;
+    p.y += eyePos.z * parallax * 0.5;
+
+    // Falling
+    p.y += time * speed;
+    // Wind tilt
+    p.x += p.y * tilt;
+
+    let cell = floor(p);
+    let f = fract(p);
+    let rand = rainHash(cell);
+
+    // ~40% of cells have drops
+    if (rand > 0.4) { return 0.0; }
+
+    // Drop position and shape
+    let dropX = fract(rand * 7.3) * 0.4 + 0.3;
+    let dx = abs(f.x - dropX);
+
+    // Thin streak
+    let width = 0.006 + fract(rand * 31.1) * 0.006;
+    let streak = smoothstep(width, 0.0, dx);
+
+    // Vertical extent — long tapered streak
+    let dropLen = fract(rand * 13.7) * 0.35 + 0.4;
+    let yOff = fract(rand * 5.7) * 0.2;
+    let yMask = smoothstep(yOff, yOff + 0.05, f.y)
+              * smoothstep(yOff + dropLen, yOff + dropLen - 0.15, f.y);
+
+    // Per-drop brightness variation
+    let bri = 0.5 + fract(rand * 17.3) * 0.5;
+
+    return streak * yMask * brightness * bri;
+}
+
+fn rainEffect(uv: vec2f, time: f32, intensity: f32, eyePos: vec3f) -> vec3f {
+    if (intensity < 0.01) { return vec3f(0.0); }
+
+    var rain = 0.0;
+
+    // 5 layers — near to far (bigger parallax = nearer)
+    rain += rainLayer(uv, eyePos, time, 30.0,  3.5,  4.0,  0.030,  0.08,  0.35);
+    rain += rainLayer(uv, eyePos, time, 45.0,  4.5,  5.5,  0.018,  0.06,  0.28);
+    rain += rainLayer(uv, eyePos, time, 65.0,  6.0,  7.0,  0.010,  0.10,  0.22);
+    rain += rainLayer(uv, eyePos, time, 90.0,  8.0,  9.0,  0.005,  0.07,  0.16);
+    rain += rainLayer(uv, eyePos, time, 120.0, 10.0, 11.5, 0.002,  0.09,  0.10);
+
+    let rainColor = vec3f(0.8, 0.83, 0.9);
+    return rainColor * rain * intensity;
+}
+
+// ==========================================
 // God rays — screen-space radial blur from sun
 // ==========================================
 
@@ -126,11 +208,17 @@ fn godRays(uv: vec2f, sunUV: vec2f, strength: f32) -> vec3f {
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;
 @group(0) @binding(2) var compositeSampler: sampler;
 @group(0) @binding(3) var<uniform> postUniforms: PostParams;
+@group(0) @binding(4) var<uniform> rainCamera: RainCamera;
 
 @fragment
 fn compositeFs(inp: PostVsOut) -> @location(0) vec4f {
     var color = textureSample(sceneTex, compositeSampler, inp.uv).rgb;
     let bloom = textureSample(bloomTex, compositeSampler, inp.uv).rgb;
+
+    // Lightning flash — boost scene brightness
+    let flash = postUniforms.lightningFlash;
+    color += color * flash * 3.0;
+    color += vec3f(0.6, 0.65, 0.8) * flash;
 
     // Add bloom
     color += bloom * postUniforms.bloomStrength;
@@ -156,12 +244,27 @@ fn compositeFs(inp: PostVsOut) -> @location(0) vec4f {
     let gray = dot(color, vec3f(0.2126, 0.7152, 0.0722));
     color = mix(vec3f(gray), color, postUniforms.saturation);
 
-    // Vignette
+    // Rain
+    let ri = postUniforms.rainIntensity;
+    let mistGrey = vec3f(0.45, 0.48, 0.52);
+    color = mix(color, mistGrey, ri * 0.18);
+    let rainStreaks = rainEffect(inp.uv, postUniforms.time, ri, rainCamera.eyePos.xyz);
+    color += rainStreaks;
+    let rainDesat = 1.0 - ri * 0.1;
+    let grayR = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+    color = mix(vec3f(grayR), color, rainDesat);
+
+    // Vignette (stronger during storm)
     let vuv = inp.uv * 2.0 - 1.0;
     let aspect = postUniforms.resolution.x / postUniforms.resolution.y;
     let dist = length(vuv * vec2f(1.0, 1.0 / aspect));
-    let vignette = 1.0 - smoothstep(0.5, 1.5, dist) * postUniforms.vignetteStrength;
+    let vigStr = postUniforms.vignetteStrength + postUniforms.rainIntensity * 0.2;
+    let vignette = 1.0 - smoothstep(0.5, 1.5, dist) * vigStr;
     color *= vignette;
+
+    // Lightning flash overlay (white flash on top of everything)
+    let flashOverlay = postUniforms.lightningFlash;
+    color = mix(color, vec3f(0.9, 0.92, 0.95), flashOverlay * 0.15);
 
     return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), 1.0);
 }

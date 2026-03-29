@@ -39,13 +39,17 @@ const params = {
     cloudSpeed: 25,
 
     // Foam
-    foamBias: 1.0,
-    foamScale: 1.5,
-    foamDecay: 0.5,
+    foamBias: 0.5,
+    foamScale: 1.0,
+    foamDecay: 0.8,
 
     // Day/Night
     autoCycle: false,
     cycleSpeed: 0.02,
+
+    // Rain / Storm
+    rainIntensity: 0.0,
+    lightningFreq: 0.0,
 
     // Post-processing
     bloomStrength: 0.25,
@@ -356,7 +360,12 @@ async function main() {
 
     // --- Post-processing pipelines ---
     const postParamsBuffer = device.createBuffer({
-        size: 48, // PostParams: 12 floats = 48 bytes
+        size: 64, // PostParams: 15 floats + pad = 64 bytes
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // Rain camera: invViewProj(64) + viewProj(64) + eyePos vec4(16) = 144 bytes
+    const rainCameraBuffer = device.createBuffer({
+        size: 144,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const blurDirBuffer = device.createBuffer({
@@ -468,6 +477,7 @@ async function main() {
                 { binding: 1, resource: bloomTex0.createView() },
                 { binding: 2, resource: linearSampler },
                 { binding: 3, resource: { buffer: postParamsBuffer } },
+                { binding: 4, resource: { buffer: rainCameraBuffer } },
             ],
         });
     }
@@ -538,6 +548,56 @@ async function main() {
     cloudFolder.add(params, 'cloudCoverage', 0, 1);
     cloudFolder.add(params, 'cloudSpeed', 0, 100);
 
+    const stormFolder = gui.addFolder('Rain / Storm');
+    stormFolder.add(params, 'rainIntensity', 0, 1, 0.05).name('Rain Intensity');
+    stormFolder.add(params, 'lightningFreq', 0, 3, 0.1).name('Lightning Freq').onChange(() => resetLightningTimer());
+
+    const presets = {
+        storm() {
+            params.rainIntensity = 0.7;
+            params.lightningFreq = 0.8;
+            params.windSpeed = 65;
+            params.amplitude0 = 1200;
+            params.amplitude1 = 300;
+            params.amplitude2 = 50;
+            params.choppiness = 2.8;
+            params.cloudCoverage = 0.85;
+            params.sunElevation = 20;
+            params.exposure = 0.8;
+            params.vignetteStrength = 0.5;
+            params.saturation = 0.85;
+            params.contrast = 1.15;
+            params.foamBias = 0.8;
+            params.foamScale = 1.5;
+            regenerateSpectrum();
+            resetLightningTimer();
+            gui.controllersRecursive().forEach(c => c.updateDisplay());
+        },
+        calm() {
+            params.rainIntensity = 0.0;
+            params.lightningFreq = 0.0;
+            params.windSpeed = 40;
+            params.amplitude0 = 600;
+            params.amplitude1 = 150;
+            params.amplitude2 = 20;
+            params.choppiness = 1.8;
+            params.cloudCoverage = 0.5;
+            params.sunElevation = 56;
+            params.exposure = 1.0;
+            params.vignetteStrength = 0.3;
+            params.saturation = 1.1;
+            params.contrast = 1.1;
+            params.foamBias = 0.5;
+            params.foamScale = 1.0;
+            regenerateSpectrum();
+            lightningFlash = 0;
+            resetLightningTimer();
+            gui.controllersRecursive().forEach(c => c.updateDisplay());
+        },
+    };
+    stormFolder.add(presets, 'storm').name('\u26C8 Storm Preset');
+    stormFolder.add(presets, 'calm').name('\u2600 Calm Preset');
+
     const postFolder = gui.addFolder('Post-Processing');
     postFolder.add(params, 'bloomStrength', 0, 1).name('Bloom Strength');
     postFolder.add(params, 'bloomThreshold', 0.5, 5).name('Bloom Threshold');
@@ -546,6 +606,21 @@ async function main() {
     postFolder.add(params, 'saturation', 0, 2).name('Saturation');
     postFolder.add(params, 'vignetteStrength', 0, 1).name('Vignette');
     postFolder.add(params, 'godRayStrength', 0, 2).name('God Rays');
+
+    // ===== Lightning state =====
+    let lightningFlash = 0;
+    let lightningTimer = 0;
+    const lightningDecay = 8.0;
+
+    function resetLightningTimer() {
+        if (params.lightningFreq > 0) {
+            lightningTimer = -Math.log(Math.random() + 0.001) / params.lightningFreq;
+            lightningTimer = Math.max(lightningTimer, 0.3);
+        } else {
+            lightningTimer = 1e9;
+        }
+    }
+    resetLightningTimer();
 
     // ===== Frame loop =====
     let accTime = 0;
@@ -557,6 +632,18 @@ async function main() {
         lastTime = now;
         if (!params.paused) {
             accTime += dt * params.timeScale;
+        }
+
+        // Lightning tick
+        lightningFlash *= Math.exp(-lightningDecay * dt);
+        if (lightningFlash < 0.005) lightningFlash = 0;
+        lightningTimer -= dt;
+        if (lightningTimer <= 0 && params.lightningFreq > 0) {
+            lightningFlash = 0.6 + Math.random() * 0.4;
+            if (Math.random() < 0.3) {
+                setTimeout(() => { lightningFlash = 0.4 + Math.random() * 0.3; }, 80);
+            }
+            resetLightningTimer();
         }
 
         // Day/night cycle
@@ -613,9 +700,9 @@ async function main() {
         // Upload invViewProj for sky shader
         device.queue.writeBuffer(invViewProjBuf, 0, invVP);
 
-        // Upload post-processing params (48 bytes = 12 floats)
+        // Upload post-processing params (64 bytes = 16 floats)
         const sunUV = sunScreenPos(viewProj, sun);
-        const postData = new Float32Array(12);
+        const postData = new Float32Array(16);
         postData[0] = w;                          // resolution.x
         postData[1] = h;                          // resolution.y
         postData[2] = params.bloomStrength;
@@ -624,11 +711,22 @@ async function main() {
         postData[5] = params.contrast;
         postData[6] = params.saturation;
         postData[7] = params.vignetteStrength;
-        postData[8] = accTime;                    // time
-        postData[9] = sunUV ? sunUV[0] : -10;    // sunScreenX (-10 = disabled)
-        postData[10] = sunUV ? sunUV[1] : -10;   // sunScreenY
-        postData[11] = sunUV ? params.godRayStrength : 0; // godRayStrength (0 if sun behind camera)
+        postData[8] = params.rainIntensity;
+        postData[9] = lightningFlash;
+        postData[10] = accTime;                   // time
+        postData[11] = sunUV ? sunUV[0] : -10;   // sunScreenX
+        postData[12] = sunUV ? sunUV[1] : -10;   // sunScreenY
+        postData[13] = sunUV ? params.godRayStrength : 0;
+        postData[14] = 0;                         // pad
         device.queue.writeBuffer(postParamsBuffer, 0, postData);
+
+        // Upload rain camera data: invViewProj(64) + viewProj(64) + eyePos(16) = 144 bytes
+        const rainCamData = new Float32Array(36);
+        rainCamData.set(invVP, 0);        // 0-15: invViewProj
+        rainCamData.set(viewProj, 16);    // 16-31: viewProj
+        rainCamData.set(eye, 32);         // 32-34: eyePos xyz
+        rainCamData[35] = 0;              // 35: pad
+        device.queue.writeBuffer(rainCameraBuffer, 0, rainCamData);
 
         // --- GPU commands ---
         const encoder = device.createCommandEncoder();
